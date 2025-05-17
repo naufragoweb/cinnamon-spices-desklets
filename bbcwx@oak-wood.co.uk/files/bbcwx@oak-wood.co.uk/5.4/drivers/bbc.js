@@ -12,13 +12,15 @@ const SERVICE_STATUS_ERROR = wxBase.SERVICE_STATUS_ERROR;
 const SERVICE_STATUS_OK = wxBase.SERVICE_STATUS_OK;
 const SERVICE_STATUS_INIT = wxBase.SERVICE_STATUS_INIT; // Import SERVICE_STATUS_INIT
 
+const BBC_DRIVER_MAX_DAYS = 7; // Constant for the number of BBC days
+
 Gettext.bindtextdomain(UUID, GLib.get_home_dir() + '/.local/share/locale'); // Bind textdomain
 
 function _(str) {
   if (str) {
     return Gettext.dgettext(UUID, str) ||
            Gettext.dgettext('cinnamon', str) ||
-           str; // Fallback para a string original
+           str; // Fallback to original string 
   }
   return '';
 }
@@ -28,6 +30,7 @@ var Driver = class Driver extends wxBase.Driver {
         super(stationID, apikey);
 
         this.maxDays = 7;
+        this.maxDays = BBC_DRIVER_MAX_DAYS; // Set to instance after super()
         this.capabilities.meta.region = false;
 
         this.drivertype = 'bbc';
@@ -43,6 +46,67 @@ var Driver = class Driver extends wxBase.Driver {
         this.locationID = '';
         this.localURL = '';
     };
+
+    // Override _emptyData from wxbase.js to avoid race conditions
+    // when initializing this.data.days.
+    _emptyData() {
+        // Initializes the metadata parts of this.data
+        this.data.city = '';
+        this.data.country = '';
+        // Ensures that wgs84 is an object
+        if (typeof this.data.wgs84 !== 'object' || this.data.wgs84 === null) {
+            this.data.wgs84 = {};
+        }
+        this.data.wgs84.lat = null;
+        this.data.wgs84.lon = null;
+
+        // Initializes the status object
+        if (typeof this.data.status !== 'object' || this.data.status === null) {
+            this.data.status = {};
+        }
+        this.data.status.cc = SERVICE_STATUS_INIT;
+        this.data.status.forecast = SERVICE_STATUS_INIT;
+        this.data.status.meta = SERVICE_STATUS_INIT;
+        this.data.status.lasterror = false;
+
+        // Initializes the current conditions (cc) object
+        if (typeof this.data.cc !== 'object' || this.data.cc === null) {
+            this.data.cc = {};
+        }
+        this.data.cc.feelslike = '';
+        this.data.cc.has_temp = false;
+        this.data.cc.humidity = '';
+        this.data.cc.icon = '';
+        this.data.cc.pressure = '';
+        this.data.cc.pressure_direction = '';
+        this.data.cc.temperature = '';
+        this.data.cc.visibility = '';
+        this.data.cc.weathertext = '';
+        this.data.cc.wind_direction = '';
+        this.data.cc.wind_speed = '';
+
+        // Handle this.data.days carefully.
+        // Constructs a new array and assigns it atomically.
+        let newDaysArray = [];
+        
+        // Use the constant BBC_DRIVER_MAX_DAYS to ensure the array is always the correct size for BBC,
+        // regardless of the value of this.maxDays during the call to super() in the constructor.
+        // This ensures that the array is always the correct size, regardless of the original this.maxDays value in wxbase.
+        for (let i = 0; i < BBC_DRIVER_MAX_DAYS; i++) {
+            newDaysArray[i] = {
+                day: '',
+                humidity: '',
+                icon: '',
+                maximum_temperature: '',
+                minimum_temperature: '',
+                pressure: '',
+                weathertext: '',
+                wind_direction: '',
+                wind_speed: ''
+            };
+        }
+        this.data.days = newDaysArray; // Atomic assignment
+    }
 
     async refreshData(deskletObj) {
         // reset the data object at the beginning of refresh
@@ -350,9 +414,9 @@ var Driver = class Driver extends wxBase.Driver {
              // This case should ideally not happen if _getAPImetadata and _loadDataLocation/ _loadMetaFromID work correctly,
              // but as a fallback, try to load meta data here if status is still INIT.
              if (this.latlon) {
-                 this._loadMetaCoordinates(jsonlc); // Re-attempt loading location data
+                 this._loadMetaCoordinates(jsonlc); // Attempt loading location data
              } else {
-                 this._loadMetaFromID(jsonlc); // Re-attempt loading meta data from ID
+                 this._loadMetaFromID(jsonlc); // Attempt loading meta data from ID
              }
         }
 
@@ -416,78 +480,70 @@ var Driver = class Driver extends wxBase.Driver {
             };
         }
 
-
         // request forecast data
         if (!jsonfc || !jsonfc.forecasts || jsonfc.forecasts.length === 0) {
             this.data.status.forecast = SERVICE_STATUS_ERROR;
             if (!this.data.status.lasterror) this.data.status.lasterror = _('Invalid forecast data');
         } else {
             try {
-                this.data.days = [];
+                //this.data.days = [];
                 const isNight = (typeof jsonfc.isNight !== 'undefined') ? jsonfc.isNight : false;
 
-                for (let i = 0; i < Math.min(this.maxDays, jsonfc.forecasts.length); i++) {
-                    let day = new Object();
-                    // Use _getDayName with the index for day name
+                // Loop up to maxDays to ensure all days are attempted, even if API response is shorter
+                for (let i = 0; i < this.maxDays; i++) {
+                    //let day = new Object();
+                    // Always set the day name
+                    // Get the pre-initialized day object from the array populated by _emptyData()
+                    let day = this.data.days[i];
+                    // Set/update the day name (it was '' from _emptyData, _getDayName provides the correct name)
                     day.day = this._getDayName(i);
 
-                    // Extract detailed reports and summary report
-                    let forecastDay = jsonfc.forecasts[i];
+                    // Check if forecast data exists for this day index in the API response
+                    let forecastDay = (jsonfc.forecasts && i < jsonfc.forecasts.length) ? jsonfc.forecasts[i] : null;
 
-                    // Add checks for forecastDay and its properties
                     if (!forecastDay) {
-                         global.logWarning(`BBC Driver _loadData: forecastDay is undefined for index ${i}`);
-                         continue; // Skip this day if forecastDay is undefined
-                    }
+                         global.logWarning(`BBC Driver _loadData: forecastDay is undefined or missing for index ${i}`);
+                    } else {
+                        // Extract detailed reports and summary report
+                        let detailedReports = (forecastDay.detailed && forecastDay.detailed.reports && Array.isArray(forecastDay.detailed.reports)) ? forecastDay.detailed.reports : [];
+                        let summaryReport = (forecastDay.summary && forecastDay.summary.report) ? forecastDay.summary.report : null;
 
-                    let detailedReports = (forecastDay.detailed && forecastDay.detailed.reports && Array.isArray(forecastDay.detailed.reports)) ? forecastDay.detailed.reports : [];
-                    let summaryReport = (forecastDay.summary && forecastDay.summary.report) ? forecastDay.summary.report : null;
-
-                    // Populate day object from summary report if available
-                    if (summaryReport) {
-                        // Use nullish coalescing operator to safely assign values
-                        day.maximum_temperature = summaryReport.maxTempC ?? '';
-                        day.minimum_temperature = summaryReport.minTempC ?? '';
-                        day.weathertext = this._descriptionMap(summaryReport.weatherTypeText ?? '');
-                        day.wind_direction = summaryReport.windDirection ?? '';
-                        day.wind_speed = summaryReport.windSpeedKph ?? '';
-                        if (i === 0) {
-                            // For day 0, use isNight condition
-                            day.icon = this._mapIcon(String(summaryReport.weatherType ?? ''), isNight); // Also check weatherType
+                        // Populate day object from summary report if available
+                        if (summaryReport) {
+                            // Use nullish coalescing operator to safely assign values
+                            day.maximum_temperature = summaryReport.maxTempC ?? '';
+                            day.minimum_temperature = summaryReport.minTempC ?? '';
+                            day.weathertext = this._descriptionMap(summaryReport.weatherTypeText ?? '');
+                            day.wind_direction = summaryReport.windDirection ?? '';
+                            day.wind_speed = summaryReport.windSpeedKph ?? '';
+                            if (i === 0) {
+                                // For day 0, use isNight condition
+                                day.icon = this._mapIcon(String(summaryReport.weatherType ?? ''), isNight); // Also check weatherType
+                            } else {
+                                // For days 1 to 7, do not use isNight condition
+                                day.icon = this._mapIcon(String(summaryReport.weatherType ?? ''), false); // Also check weatherType
+                            }
                         } else {
-                            // For days 1 to 7, do not use isNight condition
-                            day.icon = this._mapIcon(String(summaryReport.weatherType ?? ''), false); // Also check weatherType
+                            global.logWarning(`BBC Driver _loadData: summaryReport is null for day ${i}`);
                         }
-                    } else {
-                        // Ensure properties exist even if summaryReport is null
-                        day.maximum_temperature = '';
-                        day.minimum_temperature = '';
-                        day.weathertext = '';
-                        day.wind_direction = '';
-                        day.wind_speed = '';
-                        day.icon = '';
-                        global.logWarning(`BBC Driver _loadData: summaryReport is null for day ${i}`);
-                    }
 
-                    // Populate humidity and pressure from first detailed report if available
-                    if (detailedReports.length > 0) {
-                         let firstDetailedReport = detailedReports[0];
-                         if (firstDetailedReport) {
-                             // Use nullish coalescing operator to safely assign values
-                             day.humidity = firstDetailedReport.humidity ?? '';
-                             day.pressure = firstDetailedReport.pressure ?? '';
-                         } else {
-                             day.humidity = '';
-                             day.pressure = '';
-                             global.logWarning(`BBC Driver _loadData: firstDetailedReport is null for day ${i}`);
-                         }
-                    } else {
-                        day.humidity = '';
-                        day.pressure = '';
-                         global.logWarning(`BBC Driver _loadData: detailedReports is empty or not array for day ${i}`);
+                        // Populate humidity and pressure from first detailed report if available
+                        if (detailedReports.length > 0) {
+                             let firstDetailedReport = detailedReports[0];
+                             if (firstDetailedReport) {
+                                 // Use nullish coalescing operator to safely assign values
+                                 day.humidity = firstDetailedReport.humidity ?? '';
+                                 day.pressure = firstDetailedReport.pressure ?? '';
+                             } else {
+                                 day.humidity = '';
+                                 day.pressure = '';
+                                 global.logWarning(`BBC Driver _loadData: firstDetailedReport is null for day ${i}`);
+                             }
+                        } else {
+                             global.logWarning(`BBC Driver _loadData: detailedReports is empty or not array for day ${i}`);
+                        }
                     }
-
-                    this.data.days.push(day);
+                    //this.data.days.push(day); // Always push the day object
                 }
                 this.data.status.forecast = SERVICE_STATUS_OK;
                 // If forecast data was OK, and current data failed, update cc status here
@@ -518,6 +574,16 @@ var Driver = class Driver extends wxBase.Driver {
              this._showError(deskletObj, this.data.status.lasterror);
         }
     }
+
+    _getDayName(index) {
+        // Use the abbreviations that correspond to the keys in desklet.js's this.daynames
+        const dayNamesAbbr = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+        const today = new Date();
+        const currentDay = today.getDay(); // 0=Sunday, 1=Monday, ..., 6=Saturday
+        const dayIndex = (currentDay + index) % 7;
+        return dayNamesAbbr[dayIndex]; // Returns the day abbreviation
+    }
+
 
     _mapIcon(icon, isNight) {
         // Map weatherTypeText strings to icon codes based on bbc_icons.txt and icons.html
